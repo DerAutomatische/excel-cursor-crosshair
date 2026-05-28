@@ -1,0 +1,21 @@
+# Build artifact at project root (Build.ps1 regenerates it; the
+# distributable copy is committed under deploy/).
+/CursorCrosshair.xlam
+
+# Excel autosave / lock files
+~$*.xls*
+~$*.xlam
+
+# Editor / IDE
+.vscode/
+.vs/
+*.suo
+*.user
+
+# OS noise
+Thumbs.db
+.DS_Store
+
+# Generic temp files
+*.tmp
+*.log

@@ -10,14 +10,20 @@ Attribute VB_Exposed = False
 Option Explicit
 
 ' Application-level cursor crosshair: highlights the entire active row +
-' active column in every open workbook using Conditional Formatting rules.
-' A third "mask" rule is placed on the active cell with StopIfTrue=True so
-' the row/column highlight does not paint over the selected cell itself,
-' keeping the selection indicator clearly visible.
+' active column in every open workbook using two Conditional Formatting
+' rules. The active cell itself is excluded inline via a multiplication
+' trick in the rule formula, so the selection indicator stays visible
+' without needing a separate mask rule.
 '
 ' Each rule's Formula1 carries a marker substring so we can identify and
 ' remove our rules reliably without holding (potentially stale)
 ' FormatCondition object references.
+'
+' All event handlers run behind a reentrancy guard (mInHandler) and
+' validate mLastSheet via IsSheetAlive before touching it — the most
+' common crash mode for Excel add-ins is event handlers re-entering
+' themselves, or touching a worksheet reference whose workbook was just
+' closed.
 
 Private Const HIGHLIGHT_COLOR  As Long   = 13561798   ' RGB(198, 239, 206) mint green
 Private Const CCH_ROW_MARKER   As String = "__CCH_ROW__"
@@ -27,21 +33,43 @@ Private Const CCH_MASK_MARKER  As String = "__CCH_MASK__"
 Public WithEvents App As Excel.Application
 
 Private mLastSheet As Worksheet
+Private mInHandler As Boolean   ' reentrancy guard
 
 Private Sub Class_Initialize()
     Set App = Excel.Application
 End Sub
 
+' Returns True only if the worksheet reference still points to a live
+' Excel object. After a workbook closes its sheet references stay in
+' module variables but accessing them can crash Excel; we use this to
+' guard every touch of mLastSheet.
+Private Function IsSheetAlive(ws As Worksheet) As Boolean
+    On Error Resume Next
+    Dim s As String
+    s = ws.Name
+    IsSheetAlive = (Err.Number = 0)
+    Err.Clear
+End Function
+
+' Validate mLastSheet before any use; clear if dead.
+Private Sub EnsureLastSheetValid()
+    If mLastSheet Is Nothing Then Exit Sub
+    If Not IsSheetAlive(mLastSheet) Then Set mLastSheet = Nothing
+End Sub
+
 ' --- Application event handlers --------------------------------------------
 
 Private Sub App_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
+    If mInHandler Then Exit Sub
+    mInHandler = True
     On Error GoTo Fail
-    If Sh Is Nothing Or Target Is Nothing Then Exit Sub
-    If TypeName(Sh) <> "Worksheet" Then Exit Sub
+    If Sh Is Nothing Or Target Is Nothing Then GoTo Done
+    If TypeName(Sh) <> "Worksheet" Then GoTo Done
 
     Application.EnableEvents = False
     Application.ScreenUpdating = False
 
+    EnsureLastSheetValid
     If Not mLastSheet Is Nothing Then
         If Not (mLastSheet Is Sh) Then RemoveCrosshairOnSheet mLastSheet
     End If
@@ -53,6 +81,7 @@ Private Sub App_SheetSelectionChange(ByVal Sh As Object, ByVal Target As Range)
 Done:
     Application.ScreenUpdating = True
     Application.EnableEvents = True
+    mInHandler = False
     Exit Sub
 Fail:
     Resume Done
@@ -63,10 +92,13 @@ Private Sub App_WorkbookOpen(ByVal Wb As Workbook)
     ' only sheet that could be showing one. Other sheets get cleaned the
     ' first time the user navigates to them (SheetActivate). Iterating
     ' every sheet on every open is too slow for multi-sheet workbooks.
+    If mInHandler Then Exit Sub
+    mInHandler = True
     On Error Resume Next
     Application.EnableEvents = False
     If TypeName(Wb.ActiveSheet) = "Worksheet" Then RemoveCrosshairOnSheet Wb.ActiveSheet
     Application.EnableEvents = True
+    mInHandler = False
 End Sub
 
 Private Sub App_WorkbookActivate(ByVal Wb As Workbook)
@@ -84,9 +116,11 @@ Private Sub App_SheetActivate(ByVal Sh As Object)
 End Sub
 
 Private Sub PaintActiveCrosshair()
-    On Error Resume Next
-    If TypeName(Application.ActiveSheet) <> "Worksheet" Then Exit Sub
-    If Application.ActiveCell Is Nothing Then Exit Sub
+    If mInHandler Then Exit Sub
+    mInHandler = True
+    On Error GoTo Fail
+    If TypeName(Application.ActiveSheet) <> "Worksheet" Then GoTo Done
+    If Application.ActiveCell Is Nothing Then GoTo Done
 
     Application.EnableEvents = False
     Application.ScreenUpdating = False
@@ -94,6 +128,7 @@ Private Sub PaintActiveCrosshair()
     Dim ws As Worksheet
     Set ws = Application.ActiveSheet
 
+    EnsureLastSheetValid
     If Not mLastSheet Is Nothing Then
         If Not (mLastSheet Is ws) Then RemoveCrosshairOnSheet mLastSheet
     End If
@@ -101,11 +136,18 @@ Private Sub PaintActiveCrosshair()
     ApplyCrosshair ws, Application.ActiveCell.Row, Application.ActiveCell.Column
     Set mLastSheet = ws
 
+Done:
     Application.ScreenUpdating = True
     Application.EnableEvents = True
+    mInHandler = False
+    Exit Sub
+Fail:
+    Resume Done
 End Sub
 
 Private Sub App_WorkbookBeforeSave(ByVal Wb As Workbook, ByVal SaveAsUI As Boolean, Cancel As Boolean)
+    If mInHandler Then Exit Sub
+    mInHandler = True
     On Error Resume Next
     Application.EnableEvents = False
     Dim ws As Worksheet
@@ -113,26 +155,45 @@ Private Sub App_WorkbookBeforeSave(ByVal Wb As Workbook, ByVal SaveAsUI As Boole
         RemoveCrosshairOnSheet ws
     Next ws
     Application.EnableEvents = True
+    mInHandler = False
 End Sub
 
 Private Sub App_WorkbookAfterSave(ByVal Wb As Workbook, ByVal Success As Boolean)
+    If mInHandler Then Exit Sub
+    mInHandler = True
     On Error Resume Next
-    If TypeName(ActiveSheet) <> "Worksheet" Then Exit Sub
-    Application.EnableEvents = False
-    Application.ScreenUpdating = False
-    ApplyCrosshair ActiveSheet, ActiveCell.Row, ActiveCell.Column
-    Set mLastSheet = ActiveSheet
-    Wb.Saved = True
-    Application.ScreenUpdating = True
-    Application.EnableEvents = True
+    If TypeName(ActiveSheet) = "Worksheet" Then
+        Application.EnableEvents = False
+        Application.ScreenUpdating = False
+        ApplyCrosshair ActiveSheet, ActiveCell.Row, ActiveCell.Column
+        Set mLastSheet = ActiveSheet
+        Wb.Saved = True
+        Application.ScreenUpdating = True
+        Application.EnableEvents = True
+    End If
+    mInHandler = False
 End Sub
 
 Private Sub App_WorkbookBeforeClose(ByVal Wb As Workbook, Cancel As Boolean)
+    If mInHandler Then Exit Sub
+    mInHandler = True
     On Error Resume Next
+    Application.EnableEvents = False
+
     Dim ws As Worksheet
     For Each ws In Wb.Worksheets
         RemoveCrosshairOnSheet ws
     Next ws
+
+    ' If mLastSheet belongs to the closing workbook, clear it before its
+    ' parent dies — otherwise the next event would touch a freed object
+    ' and Excel can crash hard.
+    If Not mLastSheet Is Nothing Then
+        If mLastSheet.Parent Is Wb Then Set mLastSheet = Nothing
+    End If
+
+    Application.EnableEvents = True
+    mInHandler = False
 End Sub
 
 ' --- Crosshair add / remove -------------------------------------------------
